@@ -1,0 +1,10 @@
+# Generated simulation and coverage outputs
+/build/
+*.ucdb
+*.wlf
+*.log
+modelsim.ini
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]

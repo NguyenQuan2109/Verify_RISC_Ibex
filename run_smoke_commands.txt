@@ -1,0 +1,163 @@
+# Run these commands from the project root:
+# /home/nguyenquan/RISCV/Kiemchung
+
+# ------------------------------------------------------------------------------
+# 1. Set project paths and tools
+# ------------------------------------------------------------------------------
+export PRJ_DIR="$(pwd)"
+export QUESTA_ROOT="/home/nguyenquan/RISCV/questasim"
+export QUESTA_UVM_LIB="$QUESTA_ROOT/uvm-1.2"
+export QUESTA_UVM_SRC="$QUESTA_ROOT/verilog_src/uvm-1.2/src"
+export QUESTA_INC="$QUESTA_ROOT/include"
+
+export RISCV_GCC="/usr/bin/riscv64-unknown-elf-gcc"
+export RISCV_OBJCOPY="/usr/bin/riscv64-unknown-elf-objcopy"
+export SPIKE_BIN="/opt/spike-cosim/bin/spike"
+export PKG_CONFIG_PATH="/opt/spike-cosim/lib/pkgconfig"
+
+export BUILD="$PRJ_DIR/build"
+export FW_BUILD="$BUILD/firmware"
+export DPI_BUILD="$BUILD/dpi"
+export LOG_BUILD="$BUILD/logs"
+
+export TEST="ibex_smoke_test"
+export UVM_TEST="$TEST"
+export SEED="1"
+export BIN="$FW_BUILD/smoke.bin"
+export LOG="$LOG_BUILD/${TEST}_${SEED}.log"
+
+# ------------------------------------------------------------------------------
+# 2. Check the required tools and installed libraries
+# ------------------------------------------------------------------------------
+test -x "$RISCV_GCC"
+test -x "$RISCV_OBJCOPY"
+command -v vlog
+command -v vsim
+test -d "$QUESTA_UVM_LIB"
+test -d "$QUESTA_UVM_SRC"
+test -f "$QUESTA_INC/svdpi.h"
+test -x "$SPIKE_BIN"
+pkg-config --exists riscv-riscv riscv-disasm riscv-fesvr
+
+# ------------------------------------------------------------------------------
+# 3. Build the RV32IMC directed smoke firmware
+# ------------------------------------------------------------------------------
+mkdir -p "$FW_BUILD"
+
+"$RISCV_GCC" \
+  -march=rv32imc \
+  -mabi=ilp32 \
+  -nostdlib \
+  -nostartfiles \
+  -Wl,--no-relax \
+  -T testlist/link.ld \
+  -o "$FW_BUILD/smoke.elf" \
+  testlist/directed_test/smoke.S
+
+"$RISCV_OBJCOPY" \
+  -O binary \
+  "$FW_BUILD/smoke.elf" \
+  "$FW_BUILD/smoke.bin"
+
+# ------------------------------------------------------------------------------
+# 4. Build the Spike cosimulation DPI shared library
+# ------------------------------------------------------------------------------
+mkdir -p "$DPI_BUILD"
+
+g++ \
+  -std=c++17 \
+  -fPIC \
+  -O2 \
+  -I"$QUESTA_INC" \
+  -I"$PRJ_DIR/cosim" \
+  $(pkg-config --cflags riscv-riscv riscv-disasm riscv-fesvr) \
+  -c tb/dpi/ibex_spike_dpi.cc \
+  -o "$DPI_BUILD/ibex_spike_dpi.o"
+
+g++ \
+  -std=c++17 \
+  -fPIC \
+  -O2 \
+  -I"$QUESTA_INC" \
+  -I"$PRJ_DIR/cosim" \
+  $(pkg-config --cflags riscv-riscv riscv-disasm riscv-fesvr) \
+  -c cosim/cosim_dpi.cc \
+  -o "$DPI_BUILD/cosim_dpi.o"
+
+g++ \
+  -std=c++17 \
+  -fPIC \
+  -O2 \
+  -I"$QUESTA_INC" \
+  -I"$PRJ_DIR/cosim" \
+  $(pkg-config --cflags riscv-riscv riscv-disasm riscv-fesvr) \
+  -c cosim/spike_cosim.cc \
+  -o "$DPI_BUILD/spike_cosim.o"
+
+g++ \
+  -shared \
+  -static-libstdc++ \
+  -static-libgcc \
+  -o "$DPI_BUILD/libibex_spike.so" \
+  "$DPI_BUILD/ibex_spike_dpi.o" \
+  "$DPI_BUILD/cosim_dpi.o" \
+  "$DPI_BUILD/spike_cosim.o" \
+  $(pkg-config --libs riscv-riscv riscv-disasm riscv-fesvr)
+
+# ------------------------------------------------------------------------------
+# 5. Create and configure the Questa work library
+# ------------------------------------------------------------------------------
+mkdir -p "$BUILD"
+
+(cd "$BUILD" && vmap -c)
+(cd "$BUILD" && test -d work || vlib work)
+(cd "$BUILD" && vmap mtiUvm "$QUESTA_UVM_LIB")
+
+# ------------------------------------------------------------------------------
+# 6. Compile RTL, IP, UVM, assertions, and testbench top
+# ------------------------------------------------------------------------------
+(cd "$BUILD" && \
+  vlog \
+    -64 \
+    -work work \
+    -L mtiUvm \
+    -sv \
+    -mfcu \
+    -cuname ibex_uvm_cu \
+    +define+RVFI \
+    +define+UVM \
+    +define+UVM_REGEX_NO_DPI \
+    +incdir+"$QUESTA_UVM_SRC" \
+    -suppress 2583,13314,13361 \
+    -timescale 1ns/1ps \
+    -f "$PRJ_DIR/filelist/rtl.f" \
+    -f "$PRJ_DIR/filelist/tb.f" \
+    -l "$BUILD/compile.log")
+
+# ------------------------------------------------------------------------------
+# 7. Run the UVM smoke test
+# ------------------------------------------------------------------------------
+mkdir -p "$LOG_BUILD"
+
+(cd "$BUILD" && \
+  vsim \
+    -64 \
+    -c \
+    -modelsimini modelsim.ini \
+    -L mtiUvm \
+    -dpicpppath /usr/bin/gcc \
+    -suppress 13408 \
+    -sv_lib "$DPI_BUILD/libibex_spike" \
+    work.ibex_tb_top \
+    -sv_seed "$SEED" \
+    +UVM_TESTNAME="$UVM_TEST" \
+    +UVM_VERBOSITY=UVM_LOW \
+    +bin="$BIN" \
+    +cosim_log="$BUILD/spike_${TEST}_${SEED}.log" \
+    -l "$LOG" \
+    -do "run -all; quit -f")
+
+# ------------------------------------------------------------------------------
+# 8. Fail the shell command if the simulation reported a UVM error or fatal
+# ------------------------------------------------------------------------------
+! grep -Eq "UVM_(FATAL|ERROR) *: *[1-9]|\*\* (Error|Fatal):" "$LOG"
